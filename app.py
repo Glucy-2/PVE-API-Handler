@@ -446,7 +446,14 @@ async def config_lxc(node: str, vmid: int):
                 cookies=request.cookies,
                 verify=False,
             )
-            return jsonify(response.json()), response.status_code
+            result = {"data": response.json()}
+            lines = result["data"].get("description")
+            if lines is not None:
+                for i, line in enumerate(lines):
+                    if not line.startswith('<') or not line.endswith('>'):
+                        result["data"]["description"] = '\n'.join(lines[i:])
+                        break
+            return jsonify(result), response.status_code
         except ResourceException as e:
             return (
                 jsonify(
