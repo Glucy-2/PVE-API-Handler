@@ -192,7 +192,7 @@ async def post_create_lxc_handler(
     proxmox.access.acl.put(
         path=f"/vms/{vmid}",
         users=userid,
-        roles="PVEVMUser",
+        roles="ContainerDesktopUser",
     )
 
 
