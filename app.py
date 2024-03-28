@@ -7,6 +7,7 @@ import subprocess
 import ipaddress
 import requests
 import asyncio
+import re
 
 
 class ProxmoxData:
@@ -184,9 +185,15 @@ async def post_create_lxc_handler(
         # 重启所有 VNC 服务
         "systemctl restart vncserver@*",
         # 退出容器 shell
-        "exit"
+        "exit",
     ]:
         subprocess.run(command, shell=True)
+    # 设置容器权限
+    proxmox.access.acl.put(
+        path=f"/vms/{vmid}",
+        users=userid,
+        roles="PVEVMUser",
+    )
 
 
 @app.route("/api2/json/nodes/<node>/lxc", methods=["GET", "POST"])
@@ -195,6 +202,27 @@ async def create_lxc(node: str):
     创建和恢复 LXC 容器 (POST) 和 获取 LXC 容器列表 (GET)
     """
     if request.method == "POST":
+        # 验证用户权限
+        try:
+            requests.get(
+                ProxmoxData.api_baseurl + f"/api2/json/nodes/{node}/lxc",
+                headers=request.headers,
+                cookies=request.cookies,
+                verify=False,
+            )
+        except ResourceException as e:
+            return (
+                jsonify(
+                    {
+                        "success": 0,
+                        "data": "修改失败：资源错误\n"
+                        + f"错误消息：{e.status_message}\n"
+                        + f"错误内容：{e.content}\n"
+                        + f"错误：{e.errors}\n",
+                    }
+                ),
+                e.status_code,
+            )
         # 获取用户 ID
         try:
             userid = unquote(request.cookies["PVEAuthCookie"]).split(":")[1]
@@ -316,7 +344,124 @@ async def create_lxc(node: str):
                 }
             )
     elif request.method == "GET":
-        return jsonify([])  # TODO
+        response = requests.get(
+            ProxmoxData.api_baseurl + f"/api2/json/nodes/{node}/lxc",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        try:
+            return jsonify(response.json()), response.status_code
+        except requests.exceptions.JSONDecodeError:
+            return response.text, response.status_code
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/config", methods=["GET", "PUT"])
+async def config_lxc(node: str, vmid: int):
+    """
+    修改 LXC 容器配置 (PUT) 和 获取 LXC 容器配置 (GET)
+    """
+    if request.method == "PUT":
+        # 验证用户权限
+        try:
+            requests.get(
+                ProxmoxData.api_baseurl + f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+                headers=request.headers,
+                cookies=request.cookies,
+                verify=False,
+            )
+        except ResourceException as e:
+            return (
+                jsonify(
+                    {
+                        "success": 0,
+                        "data": "修改失败：资源错误\n"
+                        + f"错误消息：{e.status_message}\n"
+                        + f"错误内容：{e.content}\n"
+                        + f"错误：{e.errors}\n",
+                    }
+                ),
+                e.status_code,
+            )
+        # 获取用户 ID
+        try:
+            userid = unquote(request.cookies["PVEAuthCookie"]).split(":")[1]
+        except IndexError:
+            return jsonify({"success": 0, "data": "修改失败：登录凭据无效\n"})
+        try:
+            # 修改容器配置
+            proxmox.nodes(node).lxc(vmid).config.put(
+                # 配置文件 SHA1
+                digest=request.json["digest"],
+                # 需要删除的配置列表
+                delete=request.json.get("delete"),
+                # 主机名
+                hostname=request.json.get("hostname"),
+                # CPU 核心数
+                cores=request.json.get("cores"),
+                # CPU 最大使用率
+                cpulimit=request.json.get("cpulimit"),
+                # 内存大小 (MB)
+                memory=request.json.get("memory"),
+                # 交换空间大小 (MB)
+                swap=request.json.get("swap"),
+                # 开启的 LXC 功能
+                features=request.json.get("features"),
+                # DNS 服务器
+                nameserver=request.json.get("nameserver"),
+                # 节点启动时自启
+                onboot=request.json.get("onboot"),
+                # 回滚未应用的更改
+                revert=request.json.get("revert"),
+                # 描述
+                description=f"<UserID: {userid}>\n" + request.json.get("description"),
+            )
+            return jsonify({"success": 1, "data": None})
+        except ResourceException as e:
+            return (
+                jsonify(
+                    {
+                        "success": 0,
+                        "data": "修改失败：资源错误\n"
+                        + f"错误消息：{e.status_message}\n"
+                        + f"错误内容：{e.content}\n"
+                        + f"错误：{e.errors}\n",
+                    }
+                ),
+                e.status_code,
+            )
+        except KeyError as e:
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：缺少必要参数\n"
+                    + f"错误消息：{e.args} 是必填参数\n",
+                }
+            )
+    elif request.method == "GET":
+        try:
+            response = requests.get(
+                ProxmoxData.api_baseurl + f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+                headers=request.headers,
+                cookies=request.cookies,
+                verify=False,
+            )
+            return jsonify(response.json()), response.status_code
+        except ResourceException as e:
+            return (
+                jsonify(
+                    {
+                        "success": 0,
+                        "data": "获取失败：资源错误\n"
+                        + f"错误消息：{e.status_message}\n"
+                        + f"错误内容：{e.content}\n"
+                        + f"错误：{e.errors}\n",
+                    }
+                ),
+                e.status_code,
+            )
+        except requests.exceptions.JSONDecodeError:
+            return jsonify({"success": 0, "data": response.text}), response.status_code
 
 
 for resource in proxmox.cluster.resources.get(type="vm"):
