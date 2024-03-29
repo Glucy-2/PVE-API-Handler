@@ -59,6 +59,15 @@ async def email_exists(email: str) -> bool:
         return False
 
 
+async def get_lxc_username(vmid: int) -> str:
+    """
+    获取 LXC 容器用户名
+    """
+    return subprocess.check_output(
+        ["pct", "exec", str(vmid), "--", "id", "-un", "1000"], shell=True, text=True
+    ).strip()
+
+
 @app.route("/api2/json/access/users", methods=["GET", "POST"])
 async def register_handler():
     """
