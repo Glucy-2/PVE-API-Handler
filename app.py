@@ -321,9 +321,11 @@ async def create_lxc(node: str):
                 # CPU 最大使用率
                 cpulimit=request.json.get("cpulimit", 0),
                 # 内存大小 (MB)
-                memory=request.json.get("memory", 4096),  # 4 GB
+                memory=int(request.json.get("memory", 4096)),  # 4 GB
                 # 交换空间大小 (MB)
-                swap=request.json.get("swap", request.json.get("memory", 4096) / 2),
+                swap=int(
+                    request.json.get("swap", request.json.get("memory", 4096) / 2)
+                ),
                 # root 密码
                 password=request.json.get("password"),
                 # 标签
@@ -341,6 +343,8 @@ async def create_lxc(node: str):
                 + "rate=10",  # 网络限速 (MB/s)
                 # DNS 服务器
                 nameserver=request.json.get("nameserver"),
+                # 创建成功后启动
+                start=1,
                 # 节点启动时自启
                 onboot=1,
                 # 描述
@@ -376,6 +380,14 @@ async def create_lxc(node: str):
                     "success": 0,
                     "data": "创建失败：缺少必要参数\n"
                     + f"错误消息：{e.args} 是必填参数\n",
+                }
+            )
+        except ValueError as e:
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "创建失败：参数格式错误\n"
+                    + f"错误消息：{e.args} 不是有效的数字\n",
                 }
             )
     elif request.method == "GET":
@@ -437,9 +449,9 @@ async def config_lxc(node: str, vmid: int):
                 # CPU 最大使用率
                 cpulimit=request.json.get("cpulimit"),
                 # 内存大小 (MB)
-                memory=request.json.get("memory"),
+                memory=int(request.json.get("memory")),
                 # 交换空间大小 (MB)
-                swap=request.json.get("swap"),
+                swap=int(request.json.get("swap")),
                 # 开启的 LXC 功能
                 features=request.json.get("features"),
                 # DNS 服务器
@@ -471,6 +483,14 @@ async def config_lxc(node: str, vmid: int):
                     "success": 0,
                     "data": "修改失败：缺少必要参数\n"
                     + f"错误消息：{e.args} 是必填参数\n",
+                }
+            )
+        except ValueError as e:
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：参数格式错误\n"
+                    + f"错误消息：{e.args} 不是有效的数字\n",
                 }
             )
     elif request.method == "GET":
