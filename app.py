@@ -529,6 +529,103 @@ async def config_lxc(node: str, vmid: int):
             return jsonify({"success": 0, "data": response.text}), response.status_code
 
 
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/resize", methods=["PUT"])
+async def resize_lxc_disk(node: str, vmid: int):
+    """
+    扩容 LXC 容器硬盘
+    """
+    # 验证必需参数
+    try:
+        if "rootfs" != request.json["disk"] and not re.match(
+            r"mp\d+", request.json["disk"]
+        ):
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "扩容失败：硬盘名格式错误\n"
+                    + f"错误消息：{request.json['disk']} 不是有效的硬盘名\n",
+                }
+            )
+        if not re.match(r"\+?\d+(\.\d+)?[KMGT]?", request.json["size"]):
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "修改扩容失败：硬盘名格式错误\n"
+                    + f"错误消息：{request.json['size']} 不是有效的扩容大小\n",
+                }
+            )
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "修改失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    # 验证用户权限和硬盘存在
+    try:
+        lxc_config = requests.get(
+            ProxmoxData.api_baseurl + f"/api2/json/nodes/{node}/lxc/{vmid}/config",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if lxc_config.get(request.json["disk"]) is None:
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "扩容失败：硬盘不存在\n"
+                    + f"错误消息：{request.json['disk']} 不是有效的硬盘名\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "扩容失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    try:
+        # 扩容
+        task_id = (
+            proxmox.nodes(node)
+            .lxc(vmid)
+            .resize.put(
+                # 硬盘名
+                disk=request.json["disk"],
+                # 硬盘大小
+                size=request.json["size"],
+            )
+        )
+        return jsonify({"success": 1, "data": task_id})
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "修改失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+
+
+
 for resource in proxmox.cluster.resources.get(type="vm"):
     try:
         ProxmoxData.taken_vmids.add(int(resource["vmid"]))
