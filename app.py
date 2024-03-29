@@ -156,14 +156,32 @@ async def register_handler():
 
 async def post_create_lxc_handler(
     node: str, taskid: str, vmid: int, userid: str, userpasswd: str, vncpasswd: str
-):
+) -> None:
+    """
+    创建容器后处理
+    """
+    # 等待容器创建
     task_stopped = False
     while not task_stopped:
         status = proxmox.nodes(node).tasks(taskid).status.get()
         task_stopped = status["status"] == "stopped"
         await asyncio.sleep(1)
     if status["exitstatus"] != "OK":
+        # 容器创失败了呢不管了
         return
+    # 等待容器启动
+    lxc_started = False
+    try:
+        while lxc_started != "running":
+            status = proxmox.nodes(node).lxc(vmid).status.current.get()
+            lxc_started = status["status"]
+            await asyncio.sleep(1)
+    except ResourceException as e:
+        if e.content.startwith("Configuration file ") and e.content.endswith(
+            " does not exist"
+        ):
+            # 容器不存在了呢不管了
+            return
     # 设置容器防火墙规则
     for source in {"172.18.0.0/24", "ac12::/112"}:
         proxmox.nodes(node).lxc(vmid).firewall.rules.post(
@@ -173,27 +191,35 @@ async def post_create_lxc_handler(
             source=source,
             log="nolog",
         )
-    # TODO: 判断用户名
-    username = "kylin"
-    for command in [
-        # 进入容器 shell
-        f"pct enter {vmid}",
-        # 设置用户密码
-        f"echo -e '{userpasswd}\n{userpasswd}\n' | passwd {username}",
-        # 设置 VNC 密码
-        f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | vncpasswd /home/{username}/.vnc/passwd",
-        # 重启所有 VNC 服务
-        "systemctl restart vncserver@*",
-        # 退出容器 shell
-        "exit",
-    ]:
-        subprocess.run(command, shell=True)
-    # 设置容器权限
-    proxmox.access.acl.put(
-        path=f"/vms/{vmid}",
-        users=userid,
-        roles="ContainerDesktopUser",
+    username = get_lxc_username(vmid)
+    # 设置用户密码
+    subprocess.run(
+        f"echo -e '{userpasswd}\n{userpasswd}\n' | pct exec {vmid} -- passwd {username}",
+        shell=True,
     )
+    # 设置 VNC 密码
+    subprocess.run(
+        f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | pct exec {vmid} -- vncpasswd /home/{username}/.vnc/passwd",
+        shell=True,
+    )
+    # 重启所有 VNC 服务
+    subprocess.run(
+        f"pct exec {vmid} -- systemctl restart vncserver@*",
+        shell=True,
+    )
+    # 设置容器权限
+    try:
+        proxmox.access.acl.put(
+            path=f"/vms/{vmid}",
+            users=userid,
+            roles="ContainerDesktopUser",
+        )
+    except ResourceException as e:
+        if e.content.startwith("Configuration file ") and e.content.endswith(
+            " does not exist"
+        ):
+            # 容器不存在了呢不管了
+            return
 
 
 @app.route("/api2/json/nodes/<node>/lxc", methods=["GET", "POST"])
