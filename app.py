@@ -75,7 +75,6 @@ async def register_handler():
     """
     if request.method == "POST":
         try:
-            print(request.json)
             if (
                 request.json["userid"].endswith("@pve")
                 and len(request.json["password"]) > 5
@@ -510,7 +509,6 @@ async def config_lxc(node: str, vmid: int):
                     if not line.startswith("<") or not line.endswith(">"):
                         result["data"]["description"] = "\n".join(lines[i:])
                         break
-            print(result)
             return jsonify(result), response.status_code
         except ResourceException as e:
             return (
