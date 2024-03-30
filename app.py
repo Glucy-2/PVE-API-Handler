@@ -623,12 +623,568 @@ async def resize_lxc_disk(node: str, vmid: int):
         )
 
 
-
-for resource in proxmox.cluster.resources.get(type="vm"):
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/userpasswd", methods=["PUT"])
+async def change_lxc_userpasswd(node: str, vmid: int):
+    """
+    更改容器用户密码
+    """
+    # 验证必需参数
     try:
-        ProxmoxData.taken_vmids.add(int(resource["vmid"]))
-    except KeyError:
-        continue
+        userpasswd = request.json["userpasswd"]
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "修改失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 获取容器内用户名
+    username = get_lxc_username(vmid)
+    # 更改密码
+    output = await run_command(
+        f"echo -e '{userpasswd}\n{userpasswd}\n' | pct exec {vmid} -- passwd {username}",
+    )
+    return jsonify(
+        {
+            "success": 0 if output["returncode"] else 1,
+            "data": None,
+            "output": output,
+        }
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc/passwd", methods=["PUT"])
+async def change_lxc_vncpasswd(node: str, vmid: int):
+    """
+    更改容器 VNC 密码
+    """
+    # 验证必需参数
+    try:
+        vncpasswd = request.json["vncpasswd"]
+        if not re.match(r"^[a-zA-Z0-9]{6,8}$", vncpasswd):
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：VNC 密码格式错误\n"
+                    + f"错误消息：您输入的内容不是有效的 VNC 密码\n",
+                }
+            )
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "修改失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "修改失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 获取容器内用户名
+    username = get_lxc_username(vmid)
+    # 更改 VNC 密码
+    output = await run_command(
+        f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | pct exec {vmid} -- sudo -u {username} vncpasswd"
+    )
+    return (
+        jsonify(
+            {
+                "success": 0 if output["returncode"] else 1,
+                "data": None,
+                "output": output,
+            }
+        ),
+        500 if output["returncode"] else 200,
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc", methods=["GET"])
+async def get_lxc_vnc_services(node: str, vmid: int):
+    """
+    获取容器 VNC 服务列表
+    """
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "获取失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "获取失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 获取 VNC 服务列表
+    output = await run_command(
+        f"pct exec {vmid} -- systemctl list-units -t service --all --full vncserver@*"
+    )
+    if output["returncode"] != 0:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "获取 VNC 服务列表失败",
+                    "output": output,
+                }
+            ),
+            500,
+        )
+    service_list = output["stdout"].split("\n\n")[0]
+
+    # 匹配每行的服务信息
+    pattern = r"[*●\s]*vncserver@(\d+)(.service)*\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)"
+    matches = re.findall(pattern, service_list)
+
+    # 解析每个服务的详细信息
+    services = []
+    for match in matches:
+        id, _, load, active, sub, description = match
+        service = {
+            "id": id,
+            "load": load,
+            "active": active,
+            "sub": sub,
+            "description": description.strip(),
+        }
+        services.append(service)
+    return jsonify(
+        {
+            "success": 1,
+            "data": None,
+            "services": services,
+        }
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc/restart", methods=["POST"])
+async def lxc_vnc_service_restart(node: str, vmid: int):
+    """
+    重启容器 VNC 服务
+    """
+    # 验证必需参数
+    try:
+        ids: list = request.json["ids"]
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "重启失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    except TypeError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "重启失败：参数格式错误\n"
+                + f"错误消息：{e.args} 不是有效的列表\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "重启失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "重启失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 重启 VNC 服务
+    output = await run_command(
+        f"pct exec {vmid} -- systemctl restart vncserver@{' vncserver@'.join(str(id) for id in ids)}"
+    )
+    return (
+        jsonify(
+            {
+                "success": 0 if output["returncode"] else 1,
+                "data": None,
+                "output": output,
+            }
+        ),
+        500 if output["returncode"] else 200,
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc/start", methods=["POST"])
+async def lxc_vnc_service_start(node: str, vmid: int):
+    """
+    启动容器 VNC 服务
+    """
+    # 验证必需参数
+    try:
+        ids: list = request.json["ids"]
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "启动失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    except TypeError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "启动失败：参数格式错误\n"
+                + f"错误消息：{e.args} 不是有效的列表\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "启动失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "启动失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 开启 VNC 服务
+    output = await run_command(
+        f"pct exec {vmid} -- systemctl start vncserver@{' vncserver@'.join(str(id) for id in ids)}"
+    )
+    return (
+        jsonify(
+            {
+                "success": 0 if output["returncode"] else 1,
+                "data": None,
+                "output": output,
+            }
+        ),
+        500 if output["returncode"] else 200,
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc/stop", methods=["POST"])
+async def lxc_vnc_service_stop(node: str, vmid: int):
+    """
+    关闭容器 VNC 服务
+    """
+    # 验证必需参数
+    try:
+        ids: list = request.json["ids"]
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "关闭失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    except TypeError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "关闭失败：参数格式错误\n"
+                + f"错误消息：{e.args} 不是有效的列表\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "关闭失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "关闭失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 关闭 VNC 服务
+    output = await run_command(
+        f"pct exec {vmid} -- systemctl stop vncserver@{' vncserver@'.join(str(id) for id in ids)}"
+    )
+    return (
+        jsonify(
+            {
+                "success": 0 if output["returncode"] else 1,
+                "data": None,
+                "output": output,
+            }
+        ),
+        500 if output["returncode"] else 200,
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc/enable", methods=["POST"])
+async def lxc_vnc_service_enable(node: str, vmid: int):
+    """
+    启用容器 VNC 服务
+    """
+    # 验证必需参数
+    try:
+        ids: list = request.json["ids"]
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "启用失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    except TypeError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "启用失败：参数格式错误\n"
+                + f"错误消息：{e.args} 不是有效的列表\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "启用失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "启用失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 启用 VNC 服务
+    now = "--now" if request.json.get("ids") else ""
+    output = await run_command(
+        f"pct exec {vmid} -- systemctl enable {now} vncserver@{' vncserver@'.join(str(id) for id in ids)}"
+    )
+    return (
+        jsonify(
+            {
+                "success": 0 if output["returncode"] else 1,
+                "data": None,
+                "output": output,
+            }
+        ),
+        500 if output["returncode"] else 200,
+    )
+
+
+@app.route("/api2/json/nodes/<node>/lxc/<int:vmid>/vnc/disable", methods=["POST"])
+async def lxc_vnc_service_disable(node: str, vmid: int):
+    """
+    禁用容器 VNC 服务
+    """
+    # 验证必需参数
+    try:
+        ids: list = request.json["ids"]
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "禁用失败：缺少必要参数\n" + f"错误消息：{e.args} 是必填参数\n",
+            }
+        )
+    except TypeError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "禁用失败：参数格式错误\n"
+                + f"错误消息：{e.args} 不是有效的列表\n",
+            }
+        )
+    # 验证用户权限和容器状态
+    try:
+        current_status = requests.get(
+            ProxmoxData.api_baseurl
+            + f"/api2/json/nodes/{node}/lxc/{vmid}/status/current",
+            headers=request.headers,
+            cookies=request.cookies,
+            verify=False,
+        )
+        if current_status["status"] != "running":
+            return jsonify(
+                {
+                    "success": 0,
+                    "data": "禁用失败：容器未运行\n"
+                    + f"错误消息：容器状态为 {current_status['status']}\n",
+                }
+            )
+    except ResourceException as e:
+        return (
+            jsonify(
+                {
+                    "success": 0,
+                    "data": "禁用失败：资源错误\n"
+                    + f"错误消息：{e.status_message}\n"
+                    + f"错误内容：{e.content}\n"
+                    + f"错误：{e.errors}\n",
+                }
+            ),
+            e.status_code,
+        )
+    # 禁用 VNC 服务
+    now = "--now" if request.json.get("ids") else ""
+    output = await run_command(
+        f"pct exec {vmid} -- systemctl disable {now} vncserver@{' vncserver@'.join(str(id) for id in ids)}"
+    )
+    return (
+        jsonify(
+            {
+                "success": 0 if output["returncode"] else 1,
+                "data": None,
+                "output": output,
+            }
+        ),
+        500 if output["returncode"] else 200,
+    )
+
+
+resources = proxmox.cluster.resources.get(type="vm")
+if resources:
+    for resource in resources:
+        try:
+            ProxmoxData.taken_vmids.add(int(resource["vmid"]))
+        except KeyError:
+            continue
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
