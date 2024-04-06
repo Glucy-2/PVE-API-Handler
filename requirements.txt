@@ -2,4 +2,5 @@ asyncio
 requests
 gunicorn
 flask[async]
-proxmoxer>=2
+proxmoxer
+urllib3

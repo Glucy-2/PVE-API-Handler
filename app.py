@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from urllib3.exceptions import InsecureRequestWarning
+from urllib.parse import quote, unquote
+import urllib3
 from proxmoxer import ProxmoxAPI, ResourceException
 from flask import Flask, request, jsonify
-from urllib.parse import quote, unquote
-import subprocess
+from threading import Thread
 import ipaddress
 import requests
 import asyncio
+import logging
 import re
+
+
+# Disable SSL warnings
+urllib3.disable_warnings(InsecureRequestWarning)
 
 
 class ProxmoxData:
@@ -20,6 +27,27 @@ class ProxmoxData:
     first_ipv6 = ipaddress.IPv6Address("ac12::1:0")
     first_vmid = 1000
     taken_vmids = set()
+
+
+class LXCTemplates:
+    templates = {
+        "82rg": [
+            {
+                "name": "UbuntuKylin (优麒麟) 22.04 精简版",
+                "description": "优麒麟是由麒麟软件有限公司主导开发的全球开源项目，专注于研发“友好易用，简单轻松”的桌面环境，"
+                + "致力为全球用户带来更智能的用户体验，成为Linux开源桌面操作系统新领航！",
+                "ostemplate": "local:vztmpl/ubuntukylin-22.04-mini-20240329.tar.zst",
+                "ostype": "ubuntukylin",
+            },
+            {
+                "name": "Debian 12 (Bookworm) XFCE4 桌面环境",
+                "description": "Debian 由自由开源软件组成，提供了每个软件包合理的默认配置以及软件包生命周期内的定期安全更新，"
+                + "附带了速度快、占用系统资源少，同时仍然具有视觉吸引力和用户友好性的 XFCE4 桌面环境。",
+                "ostemplate": "local:vztmpl/debian-12-xfce4-20240331.tar.zst",
+                "ostype": "debian-xfce4",
+            },
+        ]
+    }
 
 
 proxmox = ProxmoxAPI(
@@ -35,13 +63,42 @@ proxmox = ProxmoxAPI(
 # )
 
 app = Flask(__name__)
+app.logger.setLevel(logging.DEBUG)
+
+
+def start_background_loop(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+async def refresh_ticket_loop() -> None:
+    """
+    刷新 Proxmox API 会话
+    """
+    while True:
+        await asyncio.sleep(1800)
+        proxmox.access.users.get()
+
+
+async def start_refresh_ticket():
+    loop = asyncio.new_event_loop()
+    t = Thread(target=start_background_loop, args=(loop,), daemon=True)
+    t.start()
+    task = asyncio.run_coroutine_threadsafe(refresh_ticket_loop(), loop)
+    return
+
+
+asyncio.run(start_refresh_ticket())
 
 
 async def userid_exists(userid: str) -> bool:
     """
     检查用户 ID 是否存在
     """
-    for user in proxmox.access.users.get():
+    users = proxmox.access.users.get()
+    if users is None:
+        return False
+    for user in users:
         if user["userid"] == userid:
             return True
     else:
@@ -52,20 +109,46 @@ async def email_exists(email: str) -> bool:
     """
     检查邮箱是否存在
     """
-    for user in proxmox.access.users.get():
+    users = proxmox.access.users.get()
+    if users is None:
+        return False
+    for user in users:
         if user["email"].lower() == email.lower():
             return True
     else:
         return False
 
 
+async def run_command(cmd: str) -> dict:
+    """
+    运行命令
+    """
+    app.logger.debug(f"运行命令：{cmd}")
+    proc = await asyncio.create_subprocess_shell(
+        cmd=cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    app.logger.debug(
+        f"命令：{cmd} 返回：{proc.returncode}, stdout：{stdout}, stderr：{stderr}"
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout.decode() if stdout else "",
+        "stderr": stderr.decode() if stderr else "",
+    }
+
+
 async def get_lxc_username(vmid: int) -> str:
     """
     获取 LXC 容器用户名
     """
-    return subprocess.check_output(
-        ["pct", "exec", str(vmid), "--", "id", "-un", "1000"], shell=True, text=True
-    ).strip()
+    output = await run_command(f"pct exec {vmid} -- id -un 1000")
+    if output["returncode"]:
+        app.logger.warning(f"获取 {vmid} 容器的用户名失败：{output['stderr']}")
+        return ""
+    return output["stdout"].strip()
 
 
 @app.route("/api2/json/access/users", methods=["GET", "POST"])
@@ -79,6 +162,7 @@ async def register_handler():
                 request.json["userid"].endswith("@pve")
                 and len(request.json["password"]) > 5
             ):
+                app.logger.info(f"接收到用户 {request.json['userid']} 的注册请求")
                 # 检查用户 ID 和邮箱是否已被占用
                 for user in proxmox.access.users.get():
                     if user["userid"] == request.json["userid"]:
@@ -87,7 +171,7 @@ async def register_handler():
                                 "data": None,
                                 "success": 0,
                                 "status": 500,
-                                "message": f"创建用户失败：用户{request.json['userid']}已被注册\n",
+                                "message": f"创建用户失败：用户 {request.json['userid']} 已被注册\n",
                             }
                         )
                     if (
@@ -100,7 +184,7 @@ async def register_handler():
                                 "data": None,
                                 "success": 0,
                                 "status": 500,
-                                "message": f"创建用户失败：邮箱{request.json['email']}已被注册\n",
+                                "message": f"创建用户失败：邮箱 {request.json['email']} 已被注册\n",
                             }
                         )
 
@@ -168,29 +252,46 @@ async def post_create_lxc_handler(
     """
     创建容器后处理
     """
+    app.logger.info(
+        f"接收到用户 {userid} 在节点 {node} 上的容器 {vmid} 创建任务：{taskid}，设置的用户密码为 {userpasswd}，VNC 密码为 {vncpasswd}，等待容器创建完成"
+    )
     # 等待容器创建
     task_stopped = False
     while not task_stopped:
-        status = proxmox.nodes(node).tasks(taskid).status.get()
-        task_stopped = status["status"] == "stopped"
+        task_status = proxmox.nodes(node).tasks(taskid).status.get()
+        task_stopped = task_status["status"] == "stopped"
+        app.logger.debug(
+            f"等待用户 {userid} 在节点 {node} 上的容器 {vmid} 创建任务：{taskid} 完成..."
+        )
         await asyncio.sleep(1)
-    if status["exitstatus"] != "OK":
+    if task_status["exitstatus"] != "OK":
         # 容器创失败了呢不管了
+        app.logger.info(
+            f"用户 {userid} 在节点 {node} 上的容器 {vmid} 创建任务 {taskid} 失败"
+        )
         return
     # 等待容器启动
+    app.logger.info(
+        f"用户 {userid} 在节点 {node} 上的容器 {vmid} 创建任务 {taskid} 成功，等待容器启动"
+    )
     lxc_started = False
     try:
         while lxc_started != "running":
-            status = proxmox.nodes(node).lxc(vmid).status.current.get()
-            lxc_started = status["status"]
+            lxc_status = proxmox.nodes(node).lxc(vmid).status.current.get()
+            lxc_started = lxc_status["status"]
+            app.logger.debug(f"等待用户 {userid} 在节点 {node} 上的容器 {vmid} 启动...")
             await asyncio.sleep(1)
     except ResourceException as e:
-        if e.content.startwith("Configuration file ") and e.content.endswith(
+        app.logger.info(f"用户 {userid} 在节点 {node} 上的容器 {vmid} 启动失败：{e}")
+        if e.content.startswith("Configuration file ") and e.content.endswith(
             " does not exist"
         ):
             # 容器不存在了呢不管了
             return
     # 设置容器防火墙规则
+    app.logger.info(
+        f"用户 {userid} 在节点 {node} 上的容器 {vmid} 启动成功，准备设置防火墙规则"
+    )
     for source in {"172.18.0.0/24", "ac12::/112"}:
         proxmox.nodes(node).lxc(vmid).firewall.rules.post(
             type="in",
@@ -201,21 +302,27 @@ async def post_create_lxc_handler(
         )
     username = get_lxc_username(vmid)
     # 设置用户密码
-    subprocess.run(
+    app.logger.info(f"设置用户 {userid} 在节点 {node} 上的容器 {vmid} 的用户密码")
+    data = await run_command(
         f"echo -e '{userpasswd}\n{userpasswd}\n' | pct exec {vmid} -- passwd {username}",
-        shell=True,
     )
-    # 设置 VNC 密码
-    subprocess.run(
-        f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | pct exec {vmid} -- vncpasswd /home/{username}/.vnc/passwd",
-        shell=True,
+    app.logger.debug(
+        {
+            "command": f"echo -e '{userpasswd}\n{userpasswd}\n' | pct exec {vmid} -- passwd {username}",
+            "data": data,
+        }
     )
-    # 重启所有 VNC 服务
-    subprocess.run(
-        f"pct exec {vmid} -- systemctl restart vncserver@*",
-        shell=True,
+    app.logger.info(f"设置用户 {userid} 在节点 {node} 上的容器 {vmid} 的 VNC 密码")
+    data = await run_command(
+        f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | pct exec {vmid} -- sudo -u {username} vncpasswd"
     )
-    # 设置容器权限
+    app.logger.debug(
+        {
+            "command": f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | pct exec {vmid} -- sudo -u {username} vncpasswd",
+            "data": data,
+        }
+    )
+    app.logger.info(f"设置用户 {userid} 在节点 {node} 上的容器 {vmid} 的用户权限")
     try:
         proxmox.access.acl.put(
             path=f"/vms/{vmid}",
@@ -223,7 +330,10 @@ async def post_create_lxc_handler(
             roles="ContainerDesktopUser",
         )
     except ResourceException as e:
-        if e.content.startwith("Configuration file ") and e.content.endswith(
+        app.logger.info(
+            f"设置用户 {userid} 在节点 {node} 上的容器 {vmid} 的用户权限失败：{e}"
+        )
+        if e.content.startswith("Configuration file ") and e.content.endswith(
             " does not exist"
         ):
             # 容器不存在了呢不管了
@@ -257,6 +367,9 @@ async def create_lxc(node: str):
                 ),
                 e.status_code,
             )
+        app.logger.info(
+            f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器创建请求"
+        )
         # 获取用户 ID
         try:
             userid = unquote(request.cookies["PVEAuthCookie"]).split(":")[1]
@@ -349,7 +462,13 @@ async def create_lxc(node: str):
                 # 描述
                 description=f"<UserID: {userid}>\n" + request.json.get("description"),
             )
-            asyncio.create_task(
+            app.logger.info(
+                f"提交用户 {userid} 在节点 {node} 上的容器 {available_vmid} 创建任务 {task_id}"
+            )
+            loop = asyncio.new_event_loop()
+            t = Thread(target=start_background_loop, args=(loop,), daemon=True)
+            t.start()
+            task = asyncio.run_coroutine_threadsafe(
                 post_create_lxc_handler(
                     node=node,
                     taskid=task_id,
@@ -357,7 +476,8 @@ async def create_lxc(node: str):
                     userid=userid,
                     userpasswd=userpasswd,
                     vncpasswd=vncpasswd,
-                )
+                ),
+                loop,
             )
             return jsonify({"success": 1, "data": task_id})
         except ResourceException as e:
@@ -390,6 +510,9 @@ async def create_lxc(node: str):
                 }
             )
     elif request.method == "GET":
+        app.logger.info(
+            f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器列表请求"
+        )
         response = requests.get(
             ProxmoxData.api_baseurl + f"/api2/json/nodes/{node}/lxc",
             headers=request.headers,
@@ -429,6 +552,9 @@ async def config_lxc(node: str, vmid: int):
                 ),
                 e.status_code,
             )
+        app.logger.info(
+            f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器 {vmid} 配置修改请求"
+        )
         # 获取用户 ID
         try:
             userid = unquote(request.cookies["PVEAuthCookie"]).split(":")[1]
@@ -501,6 +627,10 @@ async def config_lxc(node: str, vmid: int):
                 verify=False,
             )
             result = response.json()
+            app.logger.info(
+                f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器 {vmid} 配置获取请求"
+            )
+            # 处理描述信息 (移除开头的<>行)
             if result["data"].get("description") is None:
                 return jsonify(result), response.status_code
             lines = result["data"].get("description").split("\n")
@@ -567,7 +697,7 @@ async def resize_lxc_disk(node: str, vmid: int):
             cookies=request.cookies,
             verify=False,
         )
-        if lxc_config.get(request.json["disk"]) is None:
+        if lxc_config.json().get(request.json["disk"]) is None:
             return jsonify(
                 {
                     "success": 0,
@@ -646,7 +776,7 @@ async def change_lxc_userpasswd(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -714,7 +844,7 @@ async def change_lxc_vncpasswd(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -736,8 +866,12 @@ async def change_lxc_vncpasswd(node: str, vmid: int):
             ),
             e.status_code,
         )
+    app.logger.info(
+        f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器 {vmid} VNC 密码修改请求"
+    )
     # 获取容器内用户名
     username = get_lxc_username(vmid)
+    app.logger.debug(f"容器 {vmid} 的用户名为 {username}")
     # 更改 VNC 密码
     output = await run_command(
         f"echo -e '{vncpasswd}\n{vncpasswd}\nn\n' | pct exec {vmid} -- sudo -u {username} vncpasswd"
@@ -767,7 +901,7 @@ async def get_lxc_vnc_services(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -789,6 +923,9 @@ async def get_lxc_vnc_services(node: str, vmid: int):
             ),
             e.status_code,
         )
+    app.logger.info(
+        f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器 {vmid} VNC 服务列表请求"
+    )
     # 获取 VNC 服务列表
     output = await run_command(
         f"pct exec {vmid} -- systemctl list-units -t service --all --full vncserver@*"
@@ -862,7 +999,7 @@ async def lxc_vnc_service_restart(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -884,6 +1021,9 @@ async def lxc_vnc_service_restart(node: str, vmid: int):
             ),
             e.status_code,
         )
+    app.logger.info(
+        f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器 {vmid} VNC 服务重启请求"
+    )
     # 重启 VNC 服务
     output = await run_command(
         f"pct exec {vmid} -- systemctl restart vncserver@{' vncserver@'.join(str(id) for id in ids)}"
@@ -931,7 +1071,7 @@ async def lxc_vnc_service_start(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -953,6 +1093,9 @@ async def lxc_vnc_service_start(node: str, vmid: int):
             ),
             e.status_code,
         )
+    app.logger.info(
+        f"接收到用户 {unquote(request.cookies['PVEAuthCookie']).split(':')[1]} 在节点 {node} 上的容器 {vmid} VNC 服务启动请求"
+    )
     # 开启 VNC 服务
     output = await run_command(
         f"pct exec {vmid} -- systemctl start vncserver@{' vncserver@'.join(str(id) for id in ids)}"
@@ -1000,7 +1143,7 @@ async def lxc_vnc_service_stop(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -1043,6 +1186,7 @@ async def lxc_vnc_service_enable(node: str, vmid: int):
     """
     启用容器 VNC 服务
     """
+    app.logger.info(f"启用节点 {node} 上的容器 {vmid} 的 VNC 服务")
     # 验证必需参数
     try:
         ids: list = request.json["ids"]
@@ -1069,7 +1213,7 @@ async def lxc_vnc_service_enable(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -1113,6 +1257,7 @@ async def lxc_vnc_service_disable(node: str, vmid: int):
     """
     禁用容器 VNC 服务
     """
+    app.logger.info(f"禁用容器 {vmid} 的 VNC 服务")
     # 验证必需参数
     try:
         ids: list = request.json["ids"]
@@ -1139,7 +1284,7 @@ async def lxc_vnc_service_disable(node: str, vmid: int):
             headers=request.headers,
             cookies=request.cookies,
             verify=False,
-        )
+        ).json()
         if current_status["status"] != "running":
             return jsonify(
                 {
@@ -1176,6 +1321,23 @@ async def lxc_vnc_service_disable(node: str, vmid: int):
         ),
         500 if output["returncode"] else 200,
     )
+
+
+@app.route("/api2/json/nodes/<node>/vztmpl", methods=["GET"])
+async def get_lxc_templates(node: str):
+    """
+    获取节点上的 LXC 模板列表
+    """
+    try:
+        return jsonify(LXCTemplates.templates[node])
+    except KeyError as e:
+        return jsonify(
+            {
+                "success": 0,
+                "data": "获取失败：节点不存在\n"
+                + f"错误消息：{e.args} 不是有效的节点名\n",
+            }
+        ), 404
 
 
 resources = proxmox.cluster.resources.get(type="vm")
